@@ -1,0 +1,50 @@
+import type { JournalOutT } from "../schemas/journal";
+
+export const DEMO_JOURNAL: JournalOutT = {
+  date: "2026-06-14",
+  cycle_id: 2890441,
+  journal_entry_id: "je-demo-001",
+  notes: null,
+  behaviors: [
+    {
+      behavior_tracker_id: 1,
+      title: "Alcohol",
+      category: "Substances",
+      internal_name: "ALCOHOL",
+      answered_yes: false,
+      magnitude_value: null,
+      magnitude_label: null,
+      recorded_at: "2026-06-14T08:15:00+02:00",
+    },
+    {
+      behavior_tracker_id: 2,
+      title: "Caffeine after 2 PM",
+      category: "Substances",
+      internal_name: "CAFFEINE_AFTER_2PM",
+      answered_yes: false,
+      magnitude_value: null,
+      magnitude_label: null,
+      recorded_at: "2026-06-14T08:15:00+02:00",
+    },
+    {
+      behavior_tracker_id: 3,
+      title: "Late Meal",
+      category: "Nutrition",
+      internal_name: "LATE_MEAL",
+      answered_yes: false,
+      magnitude_value: null,
+      magnitude_label: null,
+      recorded_at: "2026-06-14T08:15:00+02:00",
+    },
+    {
+      behavior_tracker_id: 4,
+      title: "Stress Level",
+      category: "Mental",
+      internal_name: "STRESS_LEVEL",
+      answered_yes: null,
+      magnitude_value: 2,
+      magnitude_label: "Low",
+      recorded_at: "2026-06-14T08:15:00+02:00",
+    },
+  ],
+};

@@ -1,0 +1,94 @@
+@import "tailwindcss";
+
+/*
+  WHOOP-style design tokens. Single source of truth for the dark theme.
+  Hexes confirmed from _notes/ui-harvest.md (recovery zones, strain, sleep, surfaces).
+*/
+@theme {
+  /* surfaces */
+  --color-ink: #0a0c0f;
+  --color-surface: #111418;
+  --color-surface-2: #171b21;
+  --color-surface-3: #1f242c;
+  --color-line: #262c38;
+  --color-line-soft: #1a1f27;
+
+  /* text */
+  --color-fg: #ffffff;
+  --color-muted: #9aa3b5;
+  --color-dim: #5d6677;
+  --color-faint: #39404e;
+
+  /* metric semantics */
+  --color-recovery: #26e07a;   /* high (green) */
+  --color-recovery-green: #26e07a;
+  --color-recovery-yellow: #f7c13a;
+  --color-recovery-red: #fb4b4b;
+  --color-strain: #3d7fff;     /* WHOOP strain blue */
+  --color-sleep: #5b8ff9;      /* sleep blue */
+  --color-sleep-deep: #2f4bd6;
+  --color-sleep-rem: #7d6bff;
+  --color-sleep-light: #5b8ff9;
+  --color-sleep-awake: #6b7488;
+
+  /* fonts */
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+
+  /* radii */
+  --radius-card: 18px;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--color-ink);
+  color: var(--color-fg);
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+
+/* numerals: aligned, tabular for metric displays */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* hide scrollbars for the app-like scroll containers */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* faint radial glow behind the phone frame on desktop */
+.app-backdrop {
+  background:
+    radial-gradient(70% 50% at 50% 0%, rgba(61, 127, 255, 0.07), transparent 60%),
+    radial-gradient(60% 40% at 50% 100%, rgba(38, 224, 122, 0.05), transparent 60%),
+    var(--color-ink);
+}
+
+@keyframes count-pop {
+  0% { transform: translateY(6px); opacity: 0; }
+  100% { transform: translateY(0); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

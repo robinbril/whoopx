@@ -1,0 +1,30 @@
+import type { StressOutT } from "../schemas/stress";
+
+export const DEMO_STRESS: StressOutT = {
+  date: "2026-06-14",
+  current: 1.3,
+  avg: 1.1,
+  max: 2.7,
+  avg_hr_bpm: 70,
+  confidence: 0.86,
+  breakdown: { high_min: 35, medium_min: 280, low_min: 610 },
+  samples: [
+    { time: "06:00", value: 0.4 },
+    { time: "07:00", value: 0.8 },
+    { time: "08:00", value: 1.2 },
+    { time: "09:00", value: 1.6 },
+    { time: "10:00", value: 2.1 },
+    { time: "11:00", value: 2.7 },
+    { time: "12:00", value: 1.9 },
+    { time: "13:00", value: 1.4 },
+    { time: "14:00", value: 1.7 },
+    { time: "15:00", value: 2.2 },
+    { time: "16:00", value: 1.5 },
+    { time: "17:00", value: 1.1 },
+    { time: "18:00", value: 0.9 },
+    { time: "19:00", value: 1.3 },
+    { time: "20:00", value: 0.7 },
+    { time: "21:00", value: 0.5 },
+    { time: "22:00", value: 0.3 },
+  ],
+};
