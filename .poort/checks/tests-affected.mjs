@@ -83,7 +83,14 @@ const transitive = !opts.direct;
 
 // ---------- imports ----------
 
-const moduleOf = (relToRoot) => shellPath(relToRoot).replace(/\.py$/, '').replace(/\/__init__$/, '').split('/').join('.');
+// src-layout: src/ zonder __init__.py is geen package maar de importwortel
+// (src/pkg/x.py is pkg.x). Anders heette elke module src.pkg.x, raakte geen
+// test hem en viel elke wijziging terug op de hele suite.
+const srcLayout = fs.existsSync(path.join(opts.root || '.', 'src')) && !fs.existsSync(path.join(opts.root || '.', 'src', '__init__.py'));
+const moduleOf = (relToRoot) => {
+  const p = shellPath(relToRoot);
+  return (srcLayout && p.startsWith('src/') ? p.slice(4) : p).replace(/\.py$/, '').replace(/\/__init__$/, '').split('/').join('.');
+};
 
 // Welke modules een bestand importeert, absoluut gemaakt. `from a.b import c`
 // telt als a.b én a.b.c (c kan een submodule zijn).
@@ -271,6 +278,8 @@ if (untested.length && !full) {
   const names = untested.slice(0, 3).join(', ') + (untested.length > 3 ? ` (+${untested.length - 3})` : '');
   if (opts['no-fallback']) {
     for (const m of untested.slice(0, 5)) warn(`geen test raakt ${m}; deze wijziging wordt lokaal niet getest (--no-fallback)`);
+    // Een deel getest is geen bewijs voor het geheel: geen groene receipt.
+    console.log(`poort:noproof geen test raakt ${names}`);
   } else {
     // Niets geselecteerd is geen groen: de graaf mist imports via strings of
     // plugins, en code zonder test kan nog steeds de suite breken.
@@ -279,8 +288,12 @@ if (untested.length && !full) {
   }
 }
 
+// Niets geselecteerd terwijl er code veranderde: geen fout, maar ook geen bewijs.
+// poort schrijft dan geen receipt (poort:noproof) en zegt het; verify vraagt dan
+// alsnog een test, of een overgeslagen check met reden.
 if (!full && !selected.size) {
   console.log('tests-affected: geen tests geraakt');
+  console.log(`poort:noproof ${untested.length ? `geen test raakt ${untested.slice(0, 3).join(', ')}${untested.length > 3 ? ` (+${untested.length - 3})` : ''}` : 'geen enkele test gedraaid'}`);
   process.exit(0);
 }
 
@@ -316,6 +329,7 @@ if (!full && !opts.cmd) {
 // pytest de hele suite.
 if (!full && !selected.size) {
   console.log('tests-affected: geen tests over na --requires en --ignore');
+  console.log('poort:noproof alle geraakte tests vielen weg door --requires of --ignore');
   process.exit(0);
 }
 

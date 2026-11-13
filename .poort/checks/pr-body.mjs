@@ -14,10 +14,14 @@
 //
 // Gebruik:
 //   node pr-body.mjs --body-file <f> [--base <ref>]     (bestanden: <base>...HEAD + working tree)
+//   node pr-body.mjs --current [--base <ref>]           (body van de open PR van deze branch, bestanden als hierboven)
 //   node pr-body.mjs --pr <nummer> [--repo owner/name]  (backtest: body en bestanden via gh)
 //   Zonder --base: de merge-base met POORT_BASE_REF, "base" uit de config,
 //   origin/HEAD, origin/main of @{upstream} (de eerste die bestaat), anders HEAD~1,
 //   en bij één commit de lege tree.
+// --current is de push-check: de PR-poort keurt de tekst één keer als de PR opent,
+// daarna kan de branch doorgroeien terwijl de beschrijving blijft staan.
+// Geen open PR is groen: dan keurt de PR-poort hem straks.
 // Exit 1 met de redenen als de beschrijving niet klopt; exit 2 als er geen base is.
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -51,6 +55,20 @@ export function checkBody({ body, files, rules, exists }) {
     if (!exists.file(p)) errors.push(`De beschrijving noemt \`${p}\`, maar dat bestand bestaat niet in deze branch.`);
   }
   return errors;
+}
+
+// De beschrijving van de open PR van de huidige branch. Stopt zelf als die er niet is.
+function currentBody(sh) {
+  if (process.env.POORT_OFFLINE) process.exit(0);
+  const r = sh(process.env.POORT_GH || 'gh', ['pr', 'view', '--json', 'body,state']);
+  if (r.status !== 0 && /no (open )?pull requests? found/i.test(r.stderr || '')) process.exit(0);
+  if (r.status !== 0) {
+    console.log(`pr-body: PR van deze branch niet opgehaald (${String(r.stderr || r.error?.message || '').trim().split('\n')[0]}).`);
+    process.exit(1);
+  }
+  const pr = JSON.parse(r.stdout);
+  if (pr.state !== 'OPEN') process.exit(0);
+  return pr.body || '';
 }
 
 // ---------- CLI ----------
@@ -88,7 +106,7 @@ if (isMain) {
     ref = meta.headRefOid;
     if (!sh('git', ['cat-file', '-t', ref]).stdout.trim()) sh('git', ['fetch', '-q', 'origin', `pull/${opt('--pr')}/head`]);
   } else {
-    body = fs.readFileSync(opt('--body-file'), 'utf8');
+    body = argv.includes('--current') ? currentBody(sh) : fs.readFileSync(opt('--body-file'), 'utf8');
     // Base: --base, anders de merge-base met de eerste ref die bestaat.
     const candidates = [process.env.POORT_BASE_REF, cfg.base, 'origin/HEAD', 'origin/main', '@{upstream}'].filter(Boolean);
     let base = opt('--base') || '';

@@ -32,7 +32,7 @@ const isCI = () => Boolean(process.env.CI || process.env.GITHUB_ACTIONS);
 export const MAX_SECONDS = 300;
 // level: standard (snel, alleen wat elke wijziging moet bewijzen) of sensitive
 // (geld, persoonsgegevens, productie-auth): dan draaien ook de checks met
-// "sensitive": true, verplicht. Beide binnen hetzelfde budget.
+// "level": "sensitive", verplicht. Beide binnen hetzelfde budget.
 const LEVELS = ['standard', 'sensitive'];
 
 // ---------- git ----------
@@ -272,14 +272,21 @@ export function normalizeConfig(cfg) {
     // tellen mee in de receipt-sleutel en laten een {files}-check op alles draaien;
     // anders zou een groene run op alleen het configbestand alles "bewijzen".
     c.fullRe = re('fullOn', [].concat(c.fullOn ?? []));
-    c.cwd = c.cwd || '.';
+    // Eén schrijfwijze voor de map: ./web, web/ en web zijn web; ./ is de root.
+    const rawCwd = String(c.cwd || '.').replaceAll('\\', '/');
+    c.cwd = path.posix.normalize(rawCwd).replace(/\/+$/, '') || '.';
+    if (path.posix.isAbsolute(rawCwd) || /^[A-Za-z]:/.test(rawCwd) || c.cwd === '..' || c.cwd.startsWith('../')) errors.push(`${where}: cwd moet een map binnen de repo zijn (${rawCwd})`);
     // timeoutSet: wat de config vroeg, zodat doctor een te lange limiet kan noemen.
+    // Lokaal hoogstens 300 s; CI is waar het lange werk draait, daar geldt de config.
     c.timeoutSet = Number(c.timeout || MAX_SECONDS);
-    c.timeout = Math.min(c.timeoutSet, MAX_SECONDS);
+    c.timeout = isCI() ? c.timeoutSet : Math.min(c.timeoutSet, MAX_SECONDS);
     if (c.optional !== undefined && typeof c.optional !== 'boolean') errors.push(`${where}: optional is true of false`);
-    if (c.sensitive !== undefined && typeof c.sensitive !== 'boolean') errors.push(`${where}: sensitive is true of false`);
-    // Een check met "sensitive": true hoort alleen bij level sensitive; anders draait hij niet en eist verify er niets voor.
-    c.active = !c.sensitive || cfg.level === 'sensitive';
+    if (c.vendored !== undefined && c.vendored !== false) errors.push(`${where}: vendored kan alleen false zijn (de check slaat .poort/ over)`);
+    if (c.sensitive !== undefined) errors.push(`${where}: "sensitive" heet nu "level": "sensitive"`);
+    if (c.level !== undefined && c.level !== 'sensitive') errors.push(`${where}: level op een check kan alleen "sensitive" zijn`);
+    // "level": "sensitive" op een check: hoort alleen bij een repo op level sensitive.
+    // Op standard draait hij niet, met een ↷-regel, en eist verify er niets voor.
+    c.active = c.level !== 'sensitive' || cfg.level === 'sensitive';
     // urlEnv: een worktree met een eigen stack op een andere poort zet die env
     // (bijv. E2E_BASE_URL) en wordt dan op díe poort op herkomst gecontroleerd,
     // in plaats van overgeslagen omdat het vaste adres van een ander is.
@@ -300,13 +307,24 @@ export function normalizeConfig(cfg) {
     // for: de checks die deze stap nodig hebben; dan draait hij alleen als een daarvan echt draait.
     const forIds = [].concat(p.for || []);
     for (const id of forIds) if (!seen.has(id)) errors.push(`${where}: for noemt een onbekende check (${id})`);
-    return { ...p, cwd: p.cwd || '.', when: [].concat(p.when || []), for: forIds, timeout: Math.min(Number(p.timeout || MAX_SECONDS), MAX_SECONDS) };
+    // Installeren mag langer duren dan een check; het telt niet mee in het budget van de checks.
+    return { ...p, cwd: p.cwd || '.', when: [].concat(p.when || []), for: forIds, timeout: Number(p.timeout || MAX_SECONDS) };
   });
+  // De lockfiles van de prepare-stappen die een check voeden, horen in zijn receipt-sleutel:
+  // andere dependencies, ander bewijs.
+  for (const c of cfg.checks) {
+    const under = (raw) => {
+      const dir = path.posix.normalize(raw).replace(/\/+$/, '') || '.';
+      return dir === '.' || c.cwd === dir || c.cwd.startsWith(dir + '/');
+    };
+    c.prepareWhen = cfg.prepare.filter((p) => (p.for.length ? p.for.includes(c.id) : under(p.cwd))).flatMap((p) => p.when);
+  }
   for (const [i, f] of (cfg.format || []).entries()) {
     if (!f.when || !f.run) errors.push(`format[${i}]: when en run zijn verplicht`);
     else if (!f.run.includes('{file}')) errors.push(`format[${i}]: run mist {file}`);
   }
   if (cfg.level !== undefined && !LEVELS.includes(cfg.level)) errors.push(`level: ${LEVELS.join(' of ')}`);
+  if (cfg.parallel !== undefined && !(Number.isInteger(cfg.parallel) && cfg.parallel > 0)) errors.push('parallel: een geheel getal groter dan 0');
   if (cfg.worktreeSlug !== undefined && !(typeof cfg.worktreeSlug === 'string' && cfg.worktreeSlug.trim())) errors.push('worktreeSlug: een shell-commando dat de naam van de worktree print');
   if (errors.length) {
     const err = new Error(`poort.config.json ongeldig:\n  ${errors.join('\n  ')}`);
@@ -318,9 +336,12 @@ export function normalizeConfig(cfg) {
 
 // matches: raakt dit bestand de check (trigger en receipt-sleutel)? fileArg: hoort
 // het in {files}? Een fullOn-bestand is wel een trigger, maar geen argument.
-const fileArg = (check, file) => check.whenRe.some((re) => re.test(file));
+const fileArg = (check, file) => !(check.vendored === false && file.startsWith('.poort/')) && check.whenRe.some((re) => re.test(file));
 const fullTrigger = (check, file) => check.fullRe.some((re) => re.test(file));
-export const matches = (check, file) => fileArg(check, file) || fullTrigger(check, file);
+// "vendored": false: de check beoordeelt stijl of structuur van de eigen code
+// (lint, opmaak, types, ripple) en slaat de gevendorde .poort/ over. Zonder die
+// instelling ziet een check alles, ook .poort/: secrets scant elk bestand.
+export const matches = (check, file) => !(check.vendored === false && file.startsWith('.poort/')) && (fileArg(check, file) || fullTrigger(check, file));
 
 // ---------- inhoud-hash (receipt-sleutel) ----------
 
@@ -381,19 +402,89 @@ export const usesBase = (check) => Boolean(check.usesBase) || String(check.run).
 // ({worktree} ingevuld), elk stack-adres en de E2E_BASE_URL die e2e krijgt.
 // {poort} en {files} niet: het pad naar .poort verschilt per worktree zonder dat
 // de check iets anders test, en de bestanden zitten al in de sleutel.
-export function checkKey(check, blobs, base = null, ctx = {}) {
+// Wat de uitkomst van een check bepaalt, uit zijn eigen definitie. Niet de versie
+// van poort, niet $why of timeout: een poort-update of een toelichting maakt geen
+// bewijs ongeldig. Wel de code van een meegeleverd script dat de check draait.
+const POORT_DIR = path.dirname(fileURLToPath(import.meta.url));
+export function checkDefinition(c) {
+  return JSON.stringify([c.id, c.tier, c.cwd, c.run, [].concat(c.when ?? '.'), [].concat(c.fullOn ?? []), c.runEnv || {}, c.type || '', c.baseline || '', Boolean(c.deleted), c.if || '', c.needs || '', c.all !== false, c.vendored !== false]);
+}
+// De meegeleverde scripts die run noemt ({poort}/checks/x.mjs), als repo-pad onder .poort/.
+// Ook als run het gevendorde pad noemt (.poort/checks/x.mjs): dan telt de versie in de repo.
+// Met hun lokale imports (./_lib.mjs, ./_shell.mjs, ...): ook die bepalen de uitkomst.
+export const poortScripts = (c) => {
+  const seen = new Map();
+  const visit = (where, rel) => {
+    if (seen.has(rel)) return;
+    seen.set(rel, where);
+    let text = '';
+    try {
+      text = fs.readFileSync(path.join(POORT_DIR, rel), 'utf8');
+    } catch {}
+    for (const m of text.matchAll(/\bfrom\s+['"]\.\/([\w.-]+\.mjs)['"]/g)) visit(where, path.posix.join(path.posix.dirname(rel), m[1]));
+  };
+  for (const m of String(c.run).matchAll(/(\{poort\}|\.poort)\/(checks\/[\w.-]+\.mjs)/g)) visit(m[1], m[2]);
+  return [...seen].map(([rel, where]) => [where, rel]);
+};
+const scriptHash = ([where, rel], blobs) => {
+  if (where === '.poort' && blobs.has(`.poort/${rel}`)) return blobs.get(`.poort/${rel}`);
+  try {
+    return createHash('sha256').update(fs.readFileSync(path.join(POORT_DIR, rel))).digest('hex');
+  } catch {
+    return 'ontbreekt';
+  }
+};
+// Een gewijzigd script (of een import ervan) in de gevendorde .poort/ telt als een
+// nieuwe definitie van de check: opnieuw over al zijn invoer, en verify vraagt bewijs.
+// modified: de .poort/-bestanden die op de base al bestonden en nu anders zijn. Een
+// script dat er nieuw bij komt, hoort bij een nieuwe check: die begint bij de
+// gewijzigde bestanden.
+export const scriptChanged = (c, modified) => poortScripts(c).some(([, rel]) => modified.includes(`.poort/${rel}`));
+const modifiedPoortFiles = (top, changed, ref) =>
+  changed.filter((f) => f.startsWith('.poort/') && spawnSync('git', ['cat-file', '-e', `${ref}:${f}`], { cwd: top }).status === 0);
+
+// Een gewijzigde poort.config.json: alleen een check die al bestond en waarvan de
+// definitie veranderde, moet opnieuw over al zijn invoer. Een nieuwe check begint
+// bij de gewijzigde bestanden; een poort-update raakt geen enkele check vanzelf.
+// baseCfg: de config op de base; undefined = de config is niet gewijzigd;
+// UNKNOWN_BASE = niet te lezen of ongeldig: dan geldt elke check als nieuw
+// gedefinieerd, want niets bewijst dat hij gelijk bleef.
+export const UNKNOWN_BASE = Symbol('onbekende base-config');
+export function definitionChanged(c, baseCfg) {
+  if (baseCfg === UNKNOWN_BASE) return true;
+  const prev = baseCfg?.checks.find((b) => b.id === c.id);
+  return Boolean(prev) && checkDefinition(prev) !== checkDefinition(c);
+}
+// Zoals loadConfig, op een andere commit: genormaliseerd en met {worktree} ingevuld.
+// Geen config op de base (eerste invoering): null, elke check is nieuw en begint
+// bij de gewijzigde bestanden. Wel een config maar onleesbaar of ongeldig: UNKNOWN_BASE.
+export function configAt(top, ref) {
+  if (spawnSync('git', ['cat-file', '-e', `${ref}:poort.config.json`], { cwd: top }).status !== 0) return null;
+  const text = git(['show', `${ref}:poort.config.json`], { cwd: top, allowFail: true });
+  const prevSlug = slugCommand;
+  try {
+    return expandWorktree(normalizeConfig(JSON.parse(text)), top);
+  } catch {
+    return UNKNOWN_BASE;
+  } finally {
+    setSlugCommand(prevSlug); // expandWorktree zet het commando van de base; dat van nu blijft gelden
+  }
+}
+const baseConfigFor = (top, changed, ref) => (changed.includes('poort.config.json') ? configAt(top, ref) : undefined);
+
+export function checkKey(check, blobs, base = null, ctx = {}, inKey = (f) => matches(check, f)) {
   const h = createHash('sha256');
   const run = ctx.worktree ? check.run.replaceAll('{worktree}', ctx.worktree) : check.run;
-  h.update(`poort:${VERSION}\0${check.id}\0${check.cwd}\0${run}\0`);
+  h.update(`${check.id}\0${check.cwd}\0${run}\0`);
   for (const s of check.stack || []) h.update(`stack:${s.url}\0`);
   if (ctx.e2eUrl) h.update(`e2e:${ctx.e2eUrl}\0`);
   // De omgeving bepaalt de uitkomst mee (TZ, netwerk): andere env, ander bewijs.
   for (const [k, v] of Object.entries(check.runEnv || {}).sort()) h.update(`env:${k}=${v}\0`);
   if (usesBase(check)) h.update(`base:${base || 'HEAD'}\0`);
-  // De poort zelf is een afhankelijkheid: een oude receipt bewijst niets over een
-  // gewijzigde check, helper of config, ook als de app gelijk bleef.
-  h.update(JSON.stringify(check));
-  const files = [...blobs.keys()].filter((f) => matches(check, f) || gateFile(f)).sort();
+  h.update(checkDefinition(check));
+  for (const s of poortScripts(check)) h.update(`script:${s.join('/')}=${scriptHash(s, blobs)}\0`);
+  const lock = new Set(check.prepareWhen || []);
+  const files = [...blobs.keys()].filter((f) => inKey(f) || lock.has(f)).sort();
   for (const f of files) h.update(`${f}\0${blobs.get(f)}\0`);
   return h.digest('hex').slice(0, 32);
 }
@@ -425,10 +516,69 @@ function writeReceipt(store, id, key, data) {
   fs.renameSync(tmp, p);
 }
 
+// ---------- dekking: welke bestanden een {files}-check zag ----------
+
+// Een {files}-check toetst alleen de bestanden die hij meekreeg (de commit-hook de
+// gestagede, pre-push het gepushte bereik). Zijn bewijs geldt dus per bestand: elke
+// run legt vast welke bestanden (pad en inhoud) hij dekte en of hij groen was. Een
+// bestand is bewezen als de laatste run die het op deze inhoud dekte, groen was;
+// een rode run blijft staan tot een groene run hetzelfde bestand op dezelfde inhoud
+// dekt. De mapnaam is de receipt-sleutel van de hele boomstand: definitie, script,
+// lockfiles, base en de inhoud van ELK bestand dat de check raakt. Een check kan
+// een bestand beoordelen op de inhoud van een ander (a.py groen zolang b.py klopt);
+// verandert een van die bestanden, dan is de dekking leeg en toetst hij opnieuw.
+// De dekking per bestand telt dus alleen binnen een en dezelfde boomstand.
+export const usesFiles = (c) => String(c.run).includes('{files}');
+export const contextKey = (check, blobs, base = null, ctx = {}) => checkKey(check, blobs, base, ctx);
+const coverageDir = (store, id, ctxKey) => path.join(store, 'receipts', id.replace(/[^\w.-]/g, '_'), `dekking-${ctxKey}`);
+const DELETED = 'verwijderd';
+let coverageSeq = 0;
+export function readCoverage(store, id, ctxKey) {
+  const latest = new Map();
+  let names = [];
+  try {
+    names = fs.readdirSync(coverageDir(store, id, ctxKey)).filter((n) => n.endsWith('.json'));
+  } catch {}
+  for (const n of names) {
+    let rec;
+    try {
+      rec = JSON.parse(fs.readFileSync(path.join(coverageDir(store, id, ctxKey), n), 'utf8'));
+    } catch {
+      continue;
+    }
+    for (const [f, blob] of Object.entries(rec.files || {})) {
+      const k = `${f}\0${blob}`;
+      const prev = latest.get(k);
+      // Later wint; bij gelijke tijd wint rood.
+      // Op wandklok (ms) en dan de teller van het proces: process.hrtime begint na een
+      // herstart opnieuw en zou een oud record laten winnen. Bij gelijke stand wint rood.
+      const order = [rec.t ?? (Date.parse(rec.at) || 0), rec.n ?? 0];
+      const later = !prev || order[0] > prev.order[0] || (order[0] === prev.order[0] && (order[1] > prev.order[1] || (order[1] === prev.order[1] && !rec.ok)));
+      if (later) latest.set(k, { ok: rec.ok, order, warns: rec.warns });
+    }
+  }
+  return latest;
+}
+export const coverageOf = (cov, f, blob) => cov.get(`${f}\0${blob ?? DELETED}`);
+function writeCoverage(store, id, ctxKey, files, blobOf, data) {
+  const dir = coverageDir(store, id, ctxKey);
+  fs.mkdirSync(dir, { recursive: true });
+  // t: wandklok in ms; n: teller binnen dit proces, voor twee runs in dezelfde ms.
+  const t = Date.now();
+  const n = ++coverageSeq;
+  const rec = { ...data, t, n, at: new Date(t).toISOString(), poort: VERSION, files: Object.fromEntries(files.map((f) => [f, blobOf(f) ?? DELETED])) };
+  const p = path.join(dir, `${t}-${process.pid}-${n}.json`);
+  fs.writeFileSync(`${p}.tmp`, JSON.stringify(rec));
+  fs.renameSync(`${p}.tmp`, p);
+}
+
 // Elke inhoud krijgt een eigen receipt; met tien agents loopt dat in de
 // duizenden. Eén keer per dag: weg wat 30 dagen niet meer geschreven is.
 const RECEIPT_MAX_AGE = 30 * 86400000;
-export function pruneReceipts(store, now = Date.now()) {
+// Dekkingsmappen horen bij een boomstand: een map die niet meer de huidige is
+// (keep) en een week stil lag, gaat weg, ook vóór de 30 dagen.
+const COVERAGE_MAX_AGE = 7 * 86400000;
+export function pruneReceipts(store, now = Date.now(), keep = null) {
   const dir = path.join(store, 'receipts');
   const stamp = path.join(dir, '.pruned');
   try {
@@ -439,8 +589,11 @@ export function pruneReceipts(store, now = Date.now()) {
     for (const id of fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory())) {
       for (const f of fs.readdirSync(path.join(dir, id.name))) {
         const p = path.join(dir, id.name, f);
-        if (now - fs.statSync(p).mtimeMs > RECEIPT_MAX_AGE) {
-          fs.rmSync(p, { force: true });
+        // Een dekkingsmap wordt bij elke run bijgeschreven (mtime).
+        const coverage = f.startsWith('dekking-');
+        const maxAge = coverage && keep && !keep.has(f.slice('dekking-'.length)) ? COVERAGE_MAX_AGE : RECEIPT_MAX_AGE;
+        if (now - fs.statSync(p).mtimeMs > maxAge) {
+          fs.rmSync(p, { recursive: true, force: true });
           n++;
         }
       }
@@ -452,7 +605,22 @@ export function pruneReceipts(store, now = Date.now()) {
 
 // ---------- stack-provenance ----------
 
-const sh = (cmd, cwd) => shellSync(cmd, { cwd, encoding: 'utf8', timeout: 15000 });
+const sh = (cmd, cwd, env = {}) => shellSync(cmd, { cwd, encoding: 'utf8', timeout: 15000, env: { ...process.env, ...env } });
+// Zelfde als sh, maar zonder de andere checks in de pool stil te zetten.
+const shAsync = (cmd, cwd, env = {}) =>
+  new Promise((resolve) => {
+    const child = spawn(shellBin(), ['-c', shellCmd(cmd)], { cwd, windowsHide: true, stdio: 'ignore', env: { ...process.env, ...env } });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, 15000);
+    child.on('error', () => resolve({ status: 127 }));
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ status: timedOut ? null : code ?? null, timedOut });
+    });
+  });
 
 export function portOf(url) {
   const u = new URL(url);
@@ -847,11 +1015,14 @@ function runShell(cmd, { cwd, timeout, env, logFile }) {
     const log = fs.createWriteStream(logFile);
     const tail = [];
     const warns = [];
+    let noproof = null;
     const take = (l) => {
       tail.push(l);
       if (tail.length > TAIL_LINES) tail.shift();
       // Adviserende checks melden zich met regels "poort:warn <tekst>": zichtbaar, niet blokkerend.
       if (l.startsWith('poort:warn ')) warns.push(l.slice(11));
+      // "poort:noproof <reden>": groen, maar zonder bewijs (er is niets getest). Geen receipt.
+      if (l.startsWith('poort:noproof ')) noproof = l.slice(14);
     };
     // Per stream een eigen restregel: een halve stdout-regel plakt anders aan stderr vast.
     const reader = () => {
@@ -893,7 +1064,7 @@ function runShell(cmd, { cwd, timeout, env, logFile }) {
       se.flush();
       if (extra) take(extra);
       // Pas terugkomen als het log op schijf staat: de uitvoer verwijst ernaar.
-      log.end(() => resolve({ code, ms: Date.now() - started, tail: tail.slice(-TAIL_LINES), warns, timedOut }));
+      log.end(() => resolve({ code, ms: Date.now() - started, tail: tail.slice(-TAIL_LINES), warns, timedOut, noproof }));
     };
     child.on('error', (e) => finish(127, String(e.message)));
     child.on('close', (code) => finish(timedOut ? 124 : code ?? 1));
@@ -963,21 +1134,41 @@ const alive = (pid) => {
   }
 };
 
-export function freePort() {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.unref();
-    srv.on('error', reject);
-    srv.listen(0, '127.0.0.1', () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
+// Het OS geeft een vrije poort; poort geeft binnen dit proces nooit twee keer
+// dezelfde. Tussen vrijgeven en binden kan een ander proces hem nog pakken: de
+// check moet dan falen met "address in use", niet stil een andere poort kiezen.
+const givenPorts = new Set();
+export async function freePort() {
+  for (;;) {
+    const port = await new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.unref();
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        const { port: p } = srv.address();
+        srv.close(() => resolve(p));
+      });
     });
-  });
+    if (!givenPorts.has(port)) {
+      givenPorts.add(port);
+      return port;
+    }
+  }
 }
 
+// Leesbaar voorvoegsel plus een hash van wat de run uniek maakt, en de hash vóór
+// het afkappen: een lange worktree-naam mag de uniekheid niet wegknippen. 63 tekens
+// is de grens van een Postgres-naam.
 let runSeq = 0;
 export function runId(top, checkId) {
-  return `poort_${worktreeSlug(top)}_${checkId}_${process.pid}_${++runSeq}`.toLowerCase().replace(/[^a-z0-9_]+/g, '_').slice(0, 63);
+  const slug = worktreeSlug(top) || 'worktree';
+  const unique = createHash('sha256').update(`${path.resolve(top)}\0${checkId}\0${process.pid}\0${++runSeq}\0${Date.now()}`).digest('hex').slice(0, 10);
+  const prefix = `poort_${slug}_${checkId}`.toLowerCase().replace(/[^a-z0-9_]+/g, '_').slice(0, 52);
+  return `${prefix}_${unique}`;
+}
+
+export function parallelLimit(cfg, cpus = os.availableParallelism?.() ?? os.cpus().length) {
+  return cfg.parallel || Math.max(2, Math.floor(cpus / 2));
 }
 
 // ---------- tijden: waar wachten agents op ----------
@@ -1055,7 +1246,7 @@ export function prepareNeed(top, gitDir, p) {
 
 // ids: de checks die nu echt draaien (niet cached). Een stap met "for" draait
 // alleen als een van zijn checks erbij is: een docs-commit installeert niets.
-export async function runPrepare(top, cfg, ids = null, deadline = Infinity) {
+export async function runPrepare(top, cfg, ids = null) {
   if (!cfg.prepare.length || process.env.POORT_NO_PREPARE) return 0;
   const { gitDir, store } = repoInfo(top);
   const logDir = logDirOf(gitDir);
@@ -1075,11 +1266,14 @@ export async function runPrepare(top, cfg, ids = null, deadline = Infinity) {
     }
     let st = prepareNeed(top, gitDir, p);
     if (!st.need) continue;
-    // Twee agents in dezelfde worktree: één installeert; de ander wacht niet maar
-    // slaat de stap zichtbaar over (een rij is precies wat poort niet doet).
+    // Twee agents in dezelfde worktree: één installeert, de ander wacht tot die
+    // klaar is (hoogstens de timeout van de stap). Checks op een half
+    // geïnstalleerde omgeving bewijzen niets. Dit is geen rij tussen worktrees:
+    // elke worktree heeft zijn eigen installatie en lock.
     const lock = `${st.stampFile}.lock`;
     fs.mkdirSync(path.dirname(lock), { recursive: true });
-    let busy = false;
+    const waitFrom = Date.now();
+    let told = false;
     for (;;) {
       try {
         fs.writeFileSync(lock, String(process.pid), { flag: 'wx' });
@@ -1101,17 +1295,16 @@ export async function runPrepare(top, cfg, ids = null, deadline = Infinity) {
         const noPid = !(Number.isInteger(pid) && pid > 0);
         const stale = noPid ? age > PREPARE_LOCK_GRACE : pid === process.pid || !alive(pid) || age > LOCK_MAX_AGE;
         if (stale) fs.rmSync(lock, { force: true });
-        else {
-          busy = true;
-          break;
+        else if (Date.now() - waitFrom > p.timeout * 1000) {
+          if (!header) out('poort prepare');
+          out(`  ✗ ${p.id}  een andere run in deze worktree installeert al langer dan ${p.timeout}s (pid ${pid}); stop die, of verwijder ${shellPath(path.relative(top, lock))} als hij niet meer draait`);
+          return 1;
+        } else {
+          if (!told) out(`  … ${p.id}: een andere run in deze worktree installeert; poort wacht tot die klaar is`);
+          told = true;
+          await sleep(500);
         }
       }
-    }
-    if (busy) {
-      if (!header) out('poort prepare');
-      header = true;
-      out(`  ↷ ${p.id}  overgeslagen: een andere run in deze worktree installeert al`);
-      continue;
     }
     try {
       st = prepareNeed(top, gitDir, p); // de ander kan het net gedaan hebben
@@ -1120,7 +1313,7 @@ export async function runPrepare(top, cfg, ids = null, deadline = Infinity) {
       header = true;
       fs.mkdirSync(logDir, { recursive: true });
       const logFile = path.join(logDir, `prepare-${p.id}.log`);
-      const r = await runShell(p.run, { cwd: path.join(top, p.cwd), timeout: Math.max(1, Math.min(p.timeout, (deadline - Date.now()) / 1000)), logFile, env: {} });
+      const r = await runShell(p.run, { cwd: path.join(top, p.cwd), timeout: p.timeout, logFile, env: {} });
       recordTiming(store, { id: `prepare:${p.id}`, status: r.code === 0 ? 'pass' : 'fail', ms: r.ms, wt: path.basename(top) });
       if (r.code !== 0) {
         out(`  ✗ ${p.id}  ${r.timedOut ? 'timeout' : `exit ${r.code}`} · ${st.why}`);
@@ -1152,32 +1345,42 @@ async function pool(items, limit, fn) {
 
 const gateFile = (file) => file === 'poort.config.json' || file.startsWith('.poort/');
 
+// De bestanden die een check krijgt ({files}), voor run en verify uit één bron:
+// when en fullOn (via hits), een gewijzigde definitie of script (alles), de map
+// van de check (cwd), vendored, en wat er bestaat. Verwijderde bestanden alleen
+// met "deleted": true: een linter struikelt over een pad dat niet bestaat, een
+// test-selector moet juist weten wat er weg is. Fixers (all: false) blijven bij
+// de gewijzigde bestanden.
+export function checkInputs(c, { hits = [], redefined = false, all = false, universe, exists }) {
+  const fullBy = all ? null : redefined && c.all !== false ? 'check-definitie' : hits.find((f) => fullTrigger(c, f));
+  const inside = (f) => c.cwd === '.' || f.startsWith(c.cwd + '/');
+  const files = (all || fullBy ? universe : hits).filter((f) => fileArg(c, f) && inside(f) && (c.deleted || exists(f)));
+  return { files, fullBy };
+}
+
 // Plant welke checks draaien. Pure functie, los testbaar.
-export function plan(cfg, { tier, changed, all, skip = [] }) {
+export function plan(cfg, { tier, changed, all, skip = [], baseCfg, modified = [] }) {
   return cfg.checks
-    .filter((c) => c.tier === tier && c.active)
+    .filter((c) => c.tier === tier)
     .map((c) => {
       const hits = changed.filter((f) => matches(c, f));
+      // Een check waarvan de definitie veranderde, moet over al zijn invoer opnieuw.
+      const redefined = definitionChanged(c, baseCfg) || scriptChanged(c, modified);
+      if (!all && !hits.length && !redefined) return { check: c, action: 'idle' };
+      if (!c.active) return { check: c, action: 'skip', reason: 'alleen bij "level": "sensitive" in poort.config.json' };
       if (skip.includes('all') || skip.includes(c.id)) return { check: c, action: 'skip', reason: 'POORT_SKIP' };
       // "all": false = niet in --all draaien, bijv. pre-commit-hooks die bestanden
       // zelf repareren: op de hele repo zou dat ongevraagd code herschrijven.
       if (all && c.all === false) return { check: c, action: 'skip', reason: 'niet in --all (wijzigt bestanden)' };
-      // Een gewijzigde poort (config of .poort/) raakt elke check.
-      const gateChanged = changed.some(gateFile);
-      if (!all && !hits.length && !gateChanged) return { check: c, action: 'idle' };
-      return { check: c, action: 'run', hits, gateChanged };
+      return { check: c, action: 'run', hits, redefined };
     });
 }
 
 export async function runTier(top, cfg, opts) {
   const { store, gitDir } = repoInfo(top);
   const { tier } = opts;
-  // Eén deadline voor de hele run (cmdRun deelt hem over commit en push): wat
-  // daarna nog zou draaien of nog draait, is overgeslagen wegens tijd, niet groen.
-  const deadline = opts.deadline ?? Date.now() + MAX_SECONDS * 1000;
-  const left = () => deadline - Date.now();
-  const budgetOut = `tijdsbudget van ${MAX_SECONDS}s op; de rest is werk voor CI`;
-  const planned = plan(cfg, opts).filter((p) => p.action !== 'idle');
+  const baseSha = opts.base || 'HEAD';
+  const planned = plan(cfg, { ...opts, baseCfg: baseConfigFor(top, opts.changed, baseSha), modified: modifiedPoortFiles(top, opts.changed, baseSha) }).filter((p) => p.action !== 'idle');
   if (!planned.length) {
     out(`poort ${tier}: niets te doen (geen check raakt de wijziging)`);
     return 0;
@@ -1185,19 +1388,53 @@ export async function runTier(top, cfg, opts) {
   const blobs = contentIndex(top);
   // Dependencies alleen voor checks die echt draaien: gepland en niet cached.
   // Een docs-commit of een push met alleen groene receipts installeert dan niets.
+  const blobOf = (f) => blobs.get(f);
+  const exists = (f) => fs.existsSync(path.join(top, f));
+  // Wat een check nog moet toetsen. Een {files}-check: de bestanden zonder groene
+  // dekking op hun huidige inhoud (zie readCoverage). Andere checks toetsen alles
+  // in een keer en hebben een receipt over al hun bestanden.
+  const currentCoverage = new Set();
+  const pendingOf = (p) => {
+    const c = p.check;
+    const { files, fullBy } = checkInputs(c, { hits: p.hits || [], redefined: p.redefined, all: opts.all, universe: [...blobs.keys()], exists });
+    const fresh = opts.noCache || c.cache === false;
+    if (!usesFiles(c)) {
+      const key = checkKey(c, blobs, opts.base, keyContext(top, c));
+      return { key, files, fullBy, cached: !fresh && Boolean(readReceipt(store, c.id, key)?.ok) };
+    }
+    const ctxKey = contextKey(c, blobs, opts.base, keyContext(top, c));
+    currentCoverage.add(ctxKey);
+    const cov = readCoverage(store, c.id, ctxKey);
+    const todo = fresh ? files : files.filter((f) => !coverageOf(cov, f, blobOf(f))?.ok);
+    return { ctxKey, files: todo, inputs: files, fullBy, cached: files.length > 0 && !todo.length };
+  };
   const willRun = planned
     .filter((p) => p.action === 'run' && e2eUrlStatus(p.check).ok)
-    .filter((p) => opts.noCache || p.check.cache === false || !readReceipt(store, p.check.id, checkKey(p.check, blobs, opts.base, keyContext(top, p.check)))?.ok)
+    .filter((p) => !pendingOf(p).cached)
     .map((p) => p.check.id);
+  const prepStarted = Date.now();
   if (willRun.length) {
-    const prep = await runPrepare(top, cfg, willRun, deadline);
+    const prep = await runPrepare(top, cfg, willRun);
     if (prep) return prep;
   }
+  // Eén budget van 300 s voor de checks van de hele run (cmdRun deelt de klok over
+  // commit en push). Installeren telt niet mee. In CI geen budget: daar draait
+  // het lange werk, met de timeout per check uit de config.
+  const clock = opts.clock || {};
+  // budgetMs: alleen voor tests, een korter budget dat pas hier begint te lopen.
+  if (clock.deadline === undefined) clock.deadline = Date.now() + (clock.budgetMs ?? MAX_SECONDS * 1000);
+  else clock.deadline += Date.now() - prepStarted;
+  const deadline = isCI() ? Infinity : clock.deadline;
+  const left = () => deadline - Date.now();
+  // Een verplichte check die niet af kon, is rood: zo komt er nooit stil iets door.
+  const budgetTip = 'maak hem sneller, laat hem alleen de geraakte bestanden of tests draaien ({files}, tests-affected), of zet "optional": true en laat CI hem draaien';
   const logDir = logDirOf(gitDir);
   fs.mkdirSync(logDir, { recursive: true });
   const width = Math.max(...planned.map((p) => p.check.id.length));
-  // Onafhankelijke checks naast elkaar, zoveel als de machine cores heeft.
-  const limit = os.availableParallelism?.() ?? os.cpus().length;
+  // Onafhankelijke checks naast elkaar, per run hoogstens de helft van de cores
+  // (minstens 2; "parallel" in de config). Tien worktrees met elk alle cores
+  // laten een laptop swappen; een rij tussen worktrees is er niet.
+  const limit = parallelLimit(cfg);
 
   const bar = progressBar(tier, planned.length);
   const one = async (p) => {
@@ -1207,18 +1444,20 @@ export async function runTier(top, cfg, opts) {
     // groen bewijs niet.
     const url = e2eUrlStatus(c);
     if (!url.ok) return { c, status: 'skip', reason: url.reason };
-    const key = checkKey(c, blobs, opts.base, keyContext(top, c));
-    const prev = readReceipt(store, c.id, key);
-    if (prev?.ok && !opts.noCache && c.cache !== false) return { c, status: 'cached', key };
-    if (left() <= 0) return { c, status: 'skip', reason: budgetOut };
+    const pend = pendingOf(p);
+    if (pend.cached) return { c, status: 'cached', key: pend.key };
+    if (left() <= 0) return { c, status: 'fail', budget: true, ms: 0, code: 0, tail: [`niet gestart: tijdsbudget van ${MAX_SECONDS}s op`] };
     if (c.if) {
-      const pre = sh(c.if, path.join(top, c.cwd));
+      const pre = await shAsync(c.if, path.join(top, c.cwd), c.runEnv);
+      // Alleen exit 1 is "hoort hier niet". Een fout (exit 2, 127) of een timeout
+      // zegt niets over de vraag, en een verplichte check mag daar niet op wegvallen.
+      if (pre.status !== 0 && pre.status !== 1) return { c, status: 'fail', code: pre.status ?? 124, ms: 0, tail: [`voorwaarde kon niet worden bepaald (${pre.timedOut ? 'timeout na 15s' : `exit ${pre.status}`}): ${c.if}`], warns: [], condition: true };
       if (pre.status !== 0) return { c, status: 'skip', reason: c.ifHint ? `voorwaarde niet voldaan: ${c.ifHint}` : `voorwaarde niet voldaan: ${c.if}` };
     }
     // `if` zegt of de check hier hoort; `needs` zegt wat hij nodig heeft om te draaien.
     // Een ontbrekende tool is rood, nooit "overgeslagen": anders lijkt een check die
     // niet kon draaien groen.
-    if (c.needs && sh(c.needs, path.join(top, c.cwd)).status !== 0) {
+    if (c.needs && (await shAsync(c.needs, path.join(top, c.cwd), c.runEnv)).status !== 0) {
       const logFile = path.join(logDir, `${c.id}.log`);
       const msg = `tool ontbreekt (${c.needs})${c.needsHint ? `; installeer: ${c.needsHint}` : ''}`;
       fs.writeFileSync(logFile, msg + '\n');
@@ -1232,14 +1471,8 @@ export async function runTier(top, cfg, opts) {
     const cwd = path.join(top, c.cwd);
     // Gewijzigde poort: de hele invoer, behalve voor fixers (all: false), die
     // anders ongevraagd de hele repo herschrijven.
-    const fullBy = opts.all ? null : p.gateChanged && c.all !== false ? 'kwaliteitspoort' : (p.hits || []).find((f) => fullTrigger(c, f));
-    const hits = (opts.all || fullBy ? [...blobs.keys()] : p.hits || []).filter((f) => fileArg(c, f));
-    // Verwijderde bestanden alleen met "deleted": true: een linter struikelt over een
-    // pad dat niet bestaat, een test-selector moet juist weten wat er weg is.
-    const rel = hits
-      .filter((f) => c.deleted || fs.existsSync(path.join(top, f)))
-      .map((f) => shellPath(path.relative(cwd, path.join(top, f))))
-      .filter((f) => !f.startsWith('..'));
+    const { files, fullBy } = pend;
+    const rel = files.map((f) => shellPath(path.relative(cwd, path.join(top, f))));
     if (c.run.includes('{files}') && !rel.length) return { c, status: 'skip', reason: 'geen bestaande bestanden binnen ' + c.cwd };
     const cmd = c.run
       .replaceAll('{files}', rel.map(shq).join(' '))
@@ -1247,17 +1480,19 @@ export async function runTier(top, cfg, opts) {
       .replaceAll('{poort}', shq(shellPath(path.dirname(fileURLToPath(import.meta.url)))))
       .replaceAll('{worktree}', worktreeSlug(top));
     const logFile = path.join(logDir, `${c.id}.log`);
-    // Eigen limiet of wat er van het budget over is, de kleinste. Gaat het budget
-    // af, dan is de check overgeslagen wegens tijd; gaat de eigen limiet af, timeout.
-    const timeLimit = Math.min(c.timeout, left() / 1000);
-    const cutByBudget = timeLimit < c.timeout;
+    // Eigen limiet of wat er van het budget over is, de kleinste. Het label zegt
+    // welke afging; rood zijn ze allebei. Een seconde speling, anders heet een
+    // gewone timeout "budget" omdat de klok al liep tijdens git en de planning.
+    const budgetSec = left() / 1000;
+    const cutByBudget = budgetSec + 1 < c.timeout;
+    const timeLimit = cutByBudget ? budgetSec : c.timeout;
     // POORT_STAGED alleen in de echte commit-hook: dan telt de gestagede diff,
     // anders (run, pre-push) de werkboom tegen de base.
     const env = { ...c.runEnv, POORT_PORT: String(await freePort()), POORT_RUN_ID: runId(top, c.id), POORT_TIER: tier, POORT_BASE: opts.base || '', POORT_BASE_REF: opts.baseRef || process.env.POORT_BASE_REF || '', POORT_STAGED: opts.staged ? '1' : '', ...e2eEnv(c) };
     const startedAt = Date.now();
     const r = await runShell(cmd, { cwd, timeout: timeLimit, logFile, env });
     r.startedAt = startedAt;
-    if (r.timedOut && cutByBudget) return { c, status: 'skip', reason: `${budgetOut} (afgebroken na ${(r.ms / 1000).toFixed(1)}s)`, ms: r.ms };
+    if (r.timedOut && cutByBudget) r.budget = true;
     // Rood met een baseline: alleen bekende fouten van de base? Dan groen, met uitleg.
     if (r.code !== 0 && !r.timedOut && c.baseline) {
       const b = judgeBaseline(top, c, p.hits || [], r.startedAt);
@@ -1268,7 +1503,13 @@ export async function runTier(top, cfg, opts) {
         r.tail = [...b.problems.map((m) => `baseline: ${m}`), ...(r.tail || [])];
       }
     }
-    if (r.code === 0) writeReceipt(store, c.id, key, { ok: true, ms: r.ms, tier, warns: r.warns });
+    // Groen zonder bewijs (bijv. geen enkele test geraakt): zichtbaar, geen receipt.
+    if (r.code === 0 && r.noproof) return { c, status: 'skip', reason: `geen bewijs: ${r.noproof}`, ms: r.ms };
+    // Ook rood komt in een receipt: verify ziet dan dat deze inhoud rood was,
+    // wat de selectie van bestanden ook zegt.
+    const result = r.code === 0 ? { ok: true, ms: r.ms, tier, warns: r.warns } : { ok: false, ms: r.ms, tier, code: r.code };
+    if (usesFiles(c)) writeCoverage(store, c.id, pend.ctxKey, files, blobOf, result);
+    else writeReceipt(store, c.id, pend.key, result);
     return { c, status: r.code === 0 ? 'pass' : 'fail', ...r, logFile, cmd, fullBy };
   };
   const results = await pool(planned, limit, async (p) => {
@@ -1288,6 +1529,9 @@ export async function runTier(top, cfg, opts) {
   if (stopping) return 1;
   const secs = (ms) => `${(ms / 1000).toFixed(1)}s`;
   const waited = (r) => (r.fullBy ? ` · alle bestanden (${r.fullBy} gewijzigd)` : '');
+  const logPath = (r) => (path.relative(top, r.logFile).startsWith('..') ? r.logFile : shellPath(path.relative(top, r.logFile)));
+  const why = (r) =>
+    r.condition ? r.tail[0] : r.budget ? `tijdsbudget van ${MAX_SECONDS}s op${r.ms ? ` na ${secs(r.ms)}` : ''}` : r.timedOut ? `timeout na ${r.c.timeout}s` : r.code === 127 && !r.ms ? r.tail[0] : `exit ${r.code}`;
   const counts = { pass: 0, cached: 0, fail: 0, skip: 0, warn: 0 };
   for (const r of results) {
     if (r.status !== 'skip') recordTiming(store, { id: r.c.id, tier, status: r.status, ms: r.ms || 0, wt: path.basename(top) });
@@ -1305,15 +1549,15 @@ export async function runTier(top, cfg, opts) {
     }
     else if (r.status === 'skip') out(`  ↷ ${id}  overgeslagen: ${r.reason}`);
     else if (r.status === 'warn') {
-      const why = r.code === 127 && !r.ms ? r.tail[0] : r.timedOut ? `timeout na ${r.c.timeout}s` : `exit ${r.code}`;
-      out(`  ! ${id}  optioneel, blokkeert niet: ${why} · ${secs(r.ms)}${waited(r)}`);
+      out(`  ! ${id}  optioneel, blokkeert niet: ${why(r)} · ${secs(r.ms || 0)}${waited(r)}`);
       for (const l of r.tail.slice(-5)) out(`    │ ${l}`);
-      out(`    log:  ${path.relative(top, r.logFile).startsWith('..') ? r.logFile : shellPath(path.relative(top, r.logFile))}`);
+      if (r.logFile) out(`    log:  ${logPath(r)}`);
       if (process.env.GITHUB_ACTIONS) out(`::warning title=poort ${r.c.id}::${r.c.id} (optioneel) faalde`);
     } else {
-      out(`  ✗ ${id}  ${r.timedOut ? `timeout na ${r.c.timeout}s` : `exit ${r.code}`} · ${secs(r.ms)}${waited(r)}`);
+      out(`  ✗ ${id}  ${why(r)} · ${secs(r.ms || 0)}${waited(r)}`);
       for (const l of r.tail) out(`    │ ${l}`);
-      out(`    log:  ${path.relative(top, r.logFile).startsWith('..') ? r.logFile : shellPath(path.relative(top, r.logFile))}`);
+      if (r.logFile) out(`    log:  ${logPath(r)}`);
+      if (r.budget || r.timedOut) out(`    tip:  ${budgetTip}`);
       if (r.c.hint) out(`    tip:  ${r.c.hint}`);
       if (process.env.GITHUB_ACTIONS) out(`::error title=poort ${r.c.id}::${r.c.id} faalde (exit ${r.code})`);
     }
@@ -1322,7 +1566,7 @@ export async function runTier(top, cfg, opts) {
     .filter(Boolean)
     .join(' ');
   out(`poort ${tier}: ${sum}${counts.fail ? ' · geblokkeerd' : ''}`);
-  pruneReceipts(store);
+  pruneReceipts(store, Date.now(), currentCoverage);
   return counts.fail ? 1 : 0;
 }
 
@@ -1409,8 +1653,11 @@ export function verify(top, cfg, { tiers = TIERS, ref = 'HEAD', base = null, ski
   for (const [f, sha] of contentIndex(top)) if (gateFile(f) && !blobs.has(f)) blobs.set(f, sha);
   const changed = refExists(top, ref) ? nul(git(['diff', '--name-only', '--no-renames', '-z', base || EMPTY_TREE, ref], { cwd: top })) : [];
   const rows = [];
+  const baseCfg = baseConfigFor(top, changed, base || EMPTY_TREE);
+  const modified = modifiedPoortFiles(top, changed, base || EMPTY_TREE);
   for (const c of cfg.checks.filter((c) => tiers.includes(c.tier) && c.required && c.active)) {
-    if (!changed.some(gateFile) && !changed.some((f) => matches(c, f))) continue;
+    const redefined = definitionChanged(c, baseCfg) || scriptChanged(c, modified);
+    if (!changed.some((f) => matches(c, f)) && !redefined) continue;
     // Overslaan kan ook hier, net als bij push, maar alleen met een reden; elke
     // keer komt in skips.log, zodat een omzeilde check altijd terug te vinden is.
     if (skip.includes('all') || skip.includes(c.id)) {
@@ -1427,17 +1674,50 @@ export function verify(top, cfg, { tiers = TIERS, ref = 'HEAD', base = null, ski
       rows.push({ id: c.id, ok: false, reason: `geen bewijs: ${url.reason}` });
       continue;
     }
-    const key = checkKey(c, blobs, base, keyContext(top, c));
-    const r = readReceipt(store, c.id, key);
-    if (r?.ok) {
-      rows.push({ id: c.id, ok: true });
-      continue;
+    // Een {files}-check: elk bestand dat hij over base..HEAD moet toetsen (dezelfde
+    // selectie als run, checkInputs) heeft een groene dekking op zijn inhoud nodig;
+    // een rode dekking blijft rood. Andere checks: een receipt over al hun bestanden.
+    let missing = 0;
+    if (usesFiles(c)) {
+      const { files } = checkInputs(c, { hits: changed.filter((f) => matches(c, f)), redefined, universe: [...blobs.keys()], exists: (f) => blobs.has(f) });
+      if (!files.length) {
+        rows.push({ id: c.id, ok: null, reason: `n.v.t. (geen bestaande bestanden binnen ${c.cwd})` });
+        continue;
+      }
+      const cov = readCoverage(store, c.id, contextKey(c, blobs, base, keyContext(top, c)));
+      const seen = files.map((f) => coverageOf(cov, f, blobs.get(f)));
+      if (seen.some((s) => s && !s.ok)) {
+        rows.push({ id: c.id, ok: false, reason: 'rood bij de laatste run van deze inhoud' });
+        continue;
+      }
+      missing = seen.filter((s) => !s).length;
+      if (!missing) {
+        rows.push({ id: c.id, ok: true });
+        continue;
+      }
+    } else {
+      const r = readReceipt(store, c.id, checkKey(c, blobs, base, keyContext(top, c)));
+      if (r?.ok) {
+        rows.push({ id: c.id, ok: true });
+        continue;
+      }
+      if (r && r.ok === false) {
+        rows.push({ id: c.id, ok: false, reason: 'rood bij de laatste run van deze inhoud' });
+        continue;
+      }
     }
-    if (c.if && sh(c.if, path.join(top, c.cwd)).status !== 0) {
-      rows.push({ id: c.id, ok: null, reason: 'n.v.t. hier (voorwaarde)' });
-      continue;
+    if (c.if) {
+      const pre = sh(c.if, path.join(top, c.cwd), c.runEnv);
+      if (pre.status !== 0 && pre.status !== 1) {
+        rows.push({ id: c.id, ok: false, reason: `voorwaarde kon niet worden bepaald (${pre.error ? 'timeout' : `exit ${pre.status}`}): ${c.if}` });
+        continue;
+      }
+      if (pre.status === 1) {
+        rows.push({ id: c.id, ok: null, reason: 'n.v.t. hier (voorwaarde)' });
+        continue;
+      }
     }
-    if (c.needs && sh(c.needs, path.join(top, c.cwd)).status !== 0) {
+    if (c.needs && sh(c.needs, path.join(top, c.cwd), c.runEnv).status !== 0) {
       rows.push({ id: c.id, ok: false, reason: `tool ontbreekt: ${c.needsHint || c.needs}` });
       continue;
     }
@@ -1448,7 +1728,7 @@ export function verify(top, cfg, { tiers = TIERS, ref = 'HEAD', base = null, ski
       rows.push({ id: c.id, ok: false, reason: `geen bewijs: ${stackStatus(top, c.stack).reason}; start je stack en draai run push, of zet "required": false als CI dit dekt` });
       continue;
     }
-    rows.push({ id: c.id, ok: false, reason: 'geen groene receipt voor deze commit' });
+    rows.push({ id: c.id, ok: false, reason: missing ? `geen groene receipt voor ${missing} bestand(en) van deze commit; run push toetst precies die` : 'geen groene receipt voor deze commit' });
   }
   return rows;
 }
@@ -1771,18 +2051,41 @@ export function fillWeb(cfg, web) {
 // kandidaat om te schrappen.
 const FULL_SUITE = /\b(pytest|vitest run|jest|playwright test|manage\.py test|go test|cargo test|(npm|pnpm|yarn)( run)? test)\b/;
 const E2E_RUN = /\b(playwright test|e2e run)\b/;
+const SECRETS_RUN = /secrets\.mjs|gitleaks|detect-secrets|trufflehog/;
 export const NEVER_FAILED_RUNS = 20;
+// Voorwaarden uit oudere profielen die stil fout gingen (eslint: n.v.t. met maar
+// een soort config; grep zonder bestand: exit 2, nu rood). init vervangt ze door
+// de huidige; een eigen voorwaarde blijft staan. Gelijk aan profiles/*.json (getest).
+export const PROFILE_IF_UPGRADES = {
+  eslint: [['ls eslint.config.* .eslintrc* >/dev/null 2>&1', 'ls eslint.config.* .eslintrc* 2>/dev/null | grep -q .']],
+  ruff: [["test -f ruff.toml || test -f .ruff.toml || grep -qs '^\\[tool\\.ruff' pyproject.toml", "test -f ruff.toml || test -f .ruff.toml || cat pyproject.toml 2>/dev/null | grep -q '^\\[tool\\.ruff'"]],
+  'ruff-format': [["grep -rqs 'ruff format' .github/workflows .pre-commit-config.yaml", "cat .github/workflows/* .pre-commit-config.yaml 2>/dev/null | grep -q 'ruff format'"]],
+  prettier: [[`grep -rqsE 'prettier|format:check' "$(git rev-parse --show-toplevel)/.github/workflows" package.json`, `cat "$(git rev-parse --show-toplevel)"/.github/workflows/* package.json 2>/dev/null | grep -qE 'prettier|format:check'`]],
+  vitest: [[`grep -q '"vitest"' package.json`, `cat package.json 2>/dev/null | grep -q '"vitest"'`]],
+  'pytest-affected': [
+    ['test -d tests', 'test -d "${PY_TESTS:-tests}"'],
+    ['test -d "$PY_TESTS"', 'test -d "${PY_TESTS:-tests}"'],
+  ],
+};
+// Checks uit de profielen die stijl of structuur van de eigen code beoordelen:
+// init zet er in een bestaande config "vendored": false op.
+// Nooit pre-commit: die kan een secrets-scanner draaien (detect-secrets, gitleaks).
+export const STYLE_CHECKS = ['py-fatal', 'ruff', 'ruff-format', 'typecheck', 'vitest', 'prettier', 'eslint', 'ripple', 'untracked-refs', 'toolchain', 'pytest-affected'];
+export const upgradedIf = (c) => PROFILE_IF_UPGRADES[c.id]?.find(([old]) => old === c.if)?.[1];
 export function lightProblems(cfg, stats = [], days = 30) {
   const found = [];
+  if (!cfg.checks.some((c) => SECRETS_RUN.test(c.run))) found.push('geen secrets-check: een gelekte sleutel gaat zo de historie in. Voeg hem toe met: node .poort/poort.mjs init --add-secrets');
   if (cfg.slots !== undefined || cfg.slotWait !== undefined) found.push('slots: doet niets meer; poort wacht nooit op een andere worktree. Haal "slots" uit poort.config.json');
   for (const c of cfg.checks) {
     if (c.heavy !== undefined) found.push(`${c.id}: "heavy" doet niets meer (geen rij); haal het weg`);
     if (!c.$why) found.push(`${c.id}: zegt niet wat hij beschermt; zet "$why"`);
+    if (SECRETS_RUN.test(c.run) && c.vendored === false) found.push(`${c.id}: een secrets-check met "vendored": false slaat .poort/ over; haal "vendored" weg, een sleutel daar lekt net zo goed`);
+    if (upgradedIf(c)) found.push(`${c.id}: verouderde voorwaarde uit een oud profiel; node .poort/poort.mjs init zet de huidige`);
     const st = stats.find((s) => s.id === c.id);
-    if (st && st.ran >= NEVER_FAILED_RUNS && !st.fail) found.push(`${c.id}: ${st.ran} keer gedraaid in ${days} dagen en nooit rood; kandidaat om te schrappen of naar CI te verhuizen`);
+    if (st && st.ran >= NEVER_FAILED_RUNS && !st.fail) found.push(`${c.id}: ${st.ran} keer groen in ${days} dagen; controleer of hij nog bewaakt wat zijn $why zegt (niet vanzelf schrappen)`);
     if (c.optional) continue;
     if (c.timeoutSet > MAX_SECONDS) found.push(`${c.id}: timeout ${c.timeoutSet}s, poort stopt hem na ${MAX_SECONDS}s; maak hem sneller of zet "optional": true`);
-    if (c.type === 'e2e' || E2E_RUN.test(c.run)) found.push(`${c.id}: e2e is lokaal verplicht; zet "optional": true en laat CI hem verplicht draaien`);
+    if (c.type === 'e2e' || E2E_RUN.test(c.run)) found.push(`${c.id}: e2e is lokaal verplicht; zet "optional": true, en zorg dat CI hem verplicht draait (docs/ci-licht.yml)`);
     else if (FULL_SUITE.test(c.run) && !c.run.includes('{files}') && !c.run.includes('tests-affected')) {
       found.push(`${c.id}: draait de volledige testsuite bij elke ${c.tier}; draai alleen de geraakte tests (node {poort}/checks/tests-affected.mjs … {files}) en laat de suite aan CI`);
     }
@@ -1886,6 +2189,54 @@ function cmdInit(args) {
     const h = installHooks(top);
     out(`✓ hooks in ${path.relative(top, h.dir) || h.dir}: ${h.done.join(', ')}`);
   }
+  // --add-secrets: de ingebouwde secrets-check in een bestaande config zetten.
+  // Hij scant daarna alleen gewijzigde bestanden: een nieuwe check draait niet over de hele repo.
+  if (args.includes('--add-secrets') && fs.existsSync(cfgFile)) {
+    const raw = parseJson(cfgFile, fs.readFileSync(cfgFile, 'utf8'));
+    if ((raw.checks || []).some((c) => c.id === 'secrets' || /secrets\.mjs/.test(c.run || ''))) out('· secrets-check staat er al');
+    else {
+      const profile = parseJson('node.json', fs.readFileSync(path.join(path.dirname(self), 'profiles', 'node.json'), 'utf8'));
+      raw.checks = [profile.checks.find((c) => c.id === 'secrets'), ...(raw.checks || [])];
+      normalizeConfig(structuredClone(raw));
+      fs.writeFileSync(cfgFile, JSON.stringify(raw, null, 2) + '\n');
+      out('✓ secrets-check toegevoegd aan poort.config.json (commit-tier, gewijzigde bestanden)');
+    }
+  }
+  // Verouderde profielvoorwaarden in een bestaande config bijwerken; eigen voorwaarden blijven.
+  if (fs.existsSync(cfgFile)) {
+    const raw = parseJson(cfgFile, fs.readFileSync(cfgFile, 'utf8'));
+    const done = [];
+    const unvendored = [];
+    for (const c of raw.checks || []) {
+      const next = upgradedIf(c);
+      if (next) {
+        c.if = next;
+        done.push(c.id);
+      }
+      // De voorwaarde en run van pytest-affected lezen PY_SRC en PY_TESTS; een oude
+      // config heeft die env niet. Zet de standaardwaarden erbij, zodat de check niet
+      // stil n.v.t. wordt.
+      // Een vaste --src . --tests tests (7d4c580-profiel) wordt de env, zodat PY_SRC en PY_TESTS echt gelden.
+      if (c.id === 'pytest-affected' && /--src \. --tests tests\b/.test(c.run || '')) {
+        c.run = c.run.replace(/--src \. --tests tests\b/, '--src "${PY_SRC:-.}" --tests "${PY_TESTS:-tests}"');
+        done.push(`${c.id} (run)`);
+      }
+      if (c.id === 'pytest-affected' && /PY_(SRC|TESTS)/.test(`${c.if} ${c.run}`) && !(c.env?.PY_SRC && c.env?.PY_TESTS)) {
+        c.env = { PY_SRC: '.', PY_TESTS: 'tests', ...(c.env || {}) };
+        done.push(`${c.id} (env)`);
+      }
+      if (STYLE_CHECKS.includes(c.id) && c.vendored === undefined && !SECRETS_RUN.test(c.run || '') && !/pre-commit/.test(c.run || '')) {
+        c.vendored = false;
+        unvendored.push(c.id);
+      }
+    }
+    if (done.length || unvendored.length) {
+      fs.writeFileSync(cfgFile, JSON.stringify(raw, null, 2) + '\n');
+      if (done.length) out(`✓ voorwaarde bijgewerkt: ${done.join(', ')}`);
+      if (unvendored.length) out(`✓ "vendored": false gezet: ${unvendored.join(', ')}`);
+      out('· deze checks zijn opnieuw gedefinieerd: de volgende push toetst ze één keer over al hun bestanden');
+    }
+  }
   const cfgNow = loadConfig(top);
   for (const m of cfgNow ? lightProblems(cfgNow) : []) out(`! ${m}`);
   const e2eCheck = (cfgNow?.checks || []).find((c) => c.type === 'e2e');
@@ -1953,13 +2304,21 @@ function cmdDoctor() {
     );
     for (const c of cfg.checks) {
       if (c.if) {
-        const ok = sh(c.if, path.join(top, c.cwd)).status === 0;
-        row(ok ? true : null, `${c.id}: ${ok ? 'voorwaarde ok' : `n.v.t. hier (${c.ifHint || c.if})`}`);
+        const st = sh(c.if, path.join(top, c.cwd), c.runEnv);
+        const ok = st.status === 0;
+        if (st.status !== 0 && st.status !== 1) row(null, `${c.id}: voorwaarde eindigt met een fout (${st.error ? 'timeout' : `exit ${st.status}`}), dus de check is rood: ${c.if}`);
+        else row(ok ? true : null, `${c.id}: ${ok ? 'voorwaarde ok' : `n.v.t. hier (${c.ifHint || c.if})`}`);
+        // Geraakte Python-tests n.v.t. terwijl de repo wel testbestanden heeft: de
+        // testmap staat elders. Dan beschermt de check niets; zeg waar je hem zet.
+        if (!ok && /tests-affected/.test(c.run)) {
+          const elsewhere = git(['ls-files'], { cwd: top }).split('\n').filter((f) => /(^|\/)(test_[^/]*|[^/]*_test)\.py$/.test(f));
+          if (elsewhere.length) row(null, `${c.id}: de repo heeft Python-tests (${elsewhere.slice(0, 2).join(', ')}), maar niet in ${c.runEnv.PY_TESTS || 'de testmap'}; zet "env": { "PY_SRC": "<code>", "PY_TESTS": "<testmap>" } op deze check`);
+        }
         // Hoort de check hier niet, dan zegt een ontbrekende tool niets: niet rood melden.
         if (!ok) continue;
       }
       if (c.needs) {
-        const ok = sh(c.needs, path.join(top, c.cwd)).status === 0;
+        const ok = sh(c.needs, path.join(top, c.cwd), c.runEnv).status === 0;
         if (!ok && preparing.has(path.join(top, c.cwd))) row(null, `${c.id}: tool nog niet geïnstalleerd; prepare doet dat bij de volgende run`);
         else row(ok, `${c.id}: ${ok ? 'tool aanwezig' : `tool ontbreekt: ${c.needsHint || c.needs}`}`);
       }
@@ -1968,7 +2327,7 @@ function cmdDoctor() {
         row(st.ok ? true : null, `${c.id}: ${st.ok ? 'eigen stack draait' : st.reason}`);
       }
     }
-    row(true, `level: ${cfg.level || 'standard'}${cfg.level === 'sensitive' ? '' : ' (checks met "sensitive": true draaien niet)'}`);
+    row(true, `level: ${cfg.level || 'standard'}${cfg.level === 'sensitive' ? '' : ' (checks met "level": "sensitive" draaien niet)'}`);
     const problems = lightProblems(cfg, timingStats(repoInfo(top).store, { days: 30 }));
     for (const m of problems) row(null, m);
     if (!problems.length) row(true, `licht: elke check en de hele run binnen ${MAX_SECONDS}s, naast elkaar, zonder rij`);
@@ -2211,8 +2570,8 @@ async function cmdRun(args) {
   // `run push` = de volledige lokale poort: commit-checks plus push-checks.
   const tiers = tier === 'push' && !args.includes('--only') ? TIERS : [tier];
   let code = 0;
-  const deadline = Date.now() + MAX_SECONDS * 1000; // één budget voor commit en push samen
-  for (const t of tiers) code = Math.max(code, await runTier(top, cfg, { tier: t, changed, all, noCache, noStack, base, baseRef, skip: skipList(), deadline }));
+  const clock = {}; // één budget voor de checks van commit en push samen
+  for (const t of tiers) code = Math.max(code, await runTier(top, cfg, { tier: t, changed, all, noCache, noStack, base, baseRef, skip: skipList(), clock }));
   return code;
 }
 
@@ -2266,6 +2625,7 @@ const HELP = `poort ${VERSION} — quality gate voor git-hooks en e2e
                               zonder profiel kiest init node, python of fullstack
         --no-hooks            alles behalve de git-hooks (bijv. in een worktree)
         --force               vervang een bestaande poort.config.json
+        --add-secrets         zet de ingebouwde secrets-check in een bestaande config
   poort run [commit|push]     draai een tier; 'push' = commit + push (default)
         --all                 alle checks, ook zonder wijziging
         --no-cache            negeer receipts
@@ -2287,7 +2647,7 @@ Omgeving:
   POORT_TAIL=30          regels uitvoer bij een rode check
   POORT_NO_STASH=1       commit-hook test de werkboom in plaats van alleen de gestagede versie
   POORT_NO_PREPARE=1     geen dependencies installeren
-  POORT_OFFLINE=1        stale-branch haalt de target-branch niet op
+  POORT_OFFLINE=1        stale-branch haalt de target-branch niet op; integration slaat over
 
 Checks krijgen: POORT_TIER, POORT_BASE (merge-base), POORT_BASE_REF (target), POORT_STAGED=1 (commit-hook),
   POORT_PORT (een vrije poort) en POORT_RUN_ID (naam alleen voor deze run, bijv. voor een testdatabase).`;

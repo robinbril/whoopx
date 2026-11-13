@@ -68,7 +68,8 @@
       "ifHint": "geen tsconfig.json",
       "needs": "test -x node_modules/.bin/tsc || test -x node_modules/.bin/vue-tsc",
       "needsHint": "npm ci (of pnpm install / yarn install)",
-      "timeout": 240
+      "timeout": 240,
+      "vendored": false
     },
     {
       "id": "vitest",
@@ -81,11 +82,12 @@
       "fullOn": "^(package\\.json|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock|vite(st)?\\.config\\.[cm]?[jt]s)$",
       "$why": "Alleen de tests die bij de gewijzigde bestanden horen (vitest related); na een dependency- of config-wijziging alle tests (fullOn).",
       "run": "if printf '%s\\n' {files} | grep -qE '(^|/)(package\\.json|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock|vite(st)?\\.config\\.[cm]?[jt]s)$'; then npx --no-install vitest run --passWithNoTests; else npx --no-install vitest related --run --passWithNoTests {files}; fi",
-      "if": "grep -q '\"vitest\"' package.json",
+      "if": "cat package.json 2>/dev/null | grep -q '\"vitest\"'",
       "ifHint": "vitest niet in package.json",
       "needs": "test -x node_modules/.bin/vitest",
       "needsHint": "npm ci (of pnpm install / yarn install)",
-      "timeout": 240
+      "timeout": 240,
+      "vendored": false
     },
     {
       "id": "prettier",
@@ -94,10 +96,11 @@
       "when": "^.*\\.([mc]?[jt]sx?|vue|svelte|css|scss|json|md)$",
       "$why": "Alleen als CI prettier draait (of een format:check-script).",
       "run": "npx --no-install prettier --check {files}",
-      "if": "grep -rqsE 'prettier|format:check' \"$(git rev-parse --show-toplevel)/.github/workflows\" package.json",
+      "if": "cat \"$(git rev-parse --show-toplevel)\"/.github/workflows/* package.json 2>/dev/null | grep -qE 'prettier|format:check'",
       "ifHint": "CI draait geen prettier",
       "needs": "test -x node_modules/.bin/prettier",
-      "needsHint": "npm ci (of pnpm install / yarn install)"
+      "needsHint": "npm ci (of pnpm install / yarn install)",
+      "vendored": false
     },
     {
       "id": "eslint",
@@ -109,7 +112,8 @@
       "if": "ls eslint.config.* >/dev/null 2>&1 || ls .eslintrc* >/dev/null 2>&1",
       "ifHint": "geen eslint-config",
       "needs": "test -x node_modules/.bin/eslint",
-      "needsHint": "npm ci (of pnpm install / yarn install)"
+      "needsHint": "npm ci (of pnpm install / yarn install)",
+      "vendored": false
     },
     {
       "id": "e2e-replay",
@@ -140,14 +144,16 @@
       "when": "^.*\\.(ts|tsx|mts|cts|js|jsx|mjs|vue)$",
       "$why": "Advies: dezelfde functie elders nog eens gedefinieerd (een kopie die niet meeverandert).",
       "run": "node {poort}/checks/ripple.mjs {files}",
-      "timeout": 60
+      "timeout": 60,
+      "vendored": false
     },
     {
       "id": "untracked-refs",
       "tier": "commit",
       "when": "\\.(py|[mc]?[jt]sx?|vue|sh|ya?ml|json|toml)$",
       "$why": "Lokaal groen, in CI rood: code die een bestand noemt dat hier wel staat maar niet in git (genegeerd of nooit toegevoegd). Blokkeert in tests, advies elders.",
-      "run": "node {poort}/checks/untracked-refs.mjs {files}"
+      "run": "node {poort}/checks/untracked-refs.mjs {files}",
+      "vendored": false
     },
     {
       "id": "actionlint",
@@ -172,7 +178,8 @@
       "$why": "Zelfde Node-major als CI (setup-node in de workflows). Een andere versie geeft fouten die alleen in CI optreden.",
       "run": "node {poort}/checks/toolchain.mjs {files}",
       "if": "test -d .github/workflows",
-      "ifHint": "geen .github/workflows"
+      "ifHint": "geen .github/workflows",
+      "vendored": false
     },
     {
       "id": "ci-parity",
