@@ -1,0 +1,200 @@
+{
+  "$comment": "JavaScript/TypeScript-app. . is de map met package.json; init vult hem in. `if` = hoort de check hier; `needs` = de tool die hij nodig heeft (ontbreekt die, dan is de check rood). Licht: elke check en de hele run binnen 300 s. Snelheid komt uit naast elkaar draaien, zonder rij, op alleen de geraakte bestanden en tests; geen bescherming vervalt. De volledige testsuite en browser-e2e zijn werk voor CI (e2e lokaal optioneel). `$why` = wat de check beschermt.",
+  "base": "origin/main",
+  "prepare": [
+    {
+      "id": "npm",
+      "cwd": ".",
+      "when": [
+        "./package-lock.json"
+      ],
+      "creates": "./node_modules",
+      "run": "npm ci --no-audit --no-fund",
+      "$why": "Verse worktree of gewijzigde lockfile: eerst installeren, anders faalt elke check op iets wat niets met de wijziging te maken heeft.",
+      "if": "test -f package-lock.json"
+    },
+    {
+      "id": "pnpm",
+      "cwd": ".",
+      "when": [
+        "./pnpm-lock.yaml"
+      ],
+      "creates": "./node_modules",
+      "run": "pnpm install --frozen-lockfile",
+      "if": "test -f pnpm-lock.yaml"
+    },
+    {
+      "id": "yarn",
+      "cwd": ".",
+      "when": [
+        "./yarn.lock"
+      ],
+      "creates": "./node_modules",
+      "run": "yarn install --frozen-lockfile",
+      "if": "test -f yarn.lock"
+    }
+  ],
+  "checks": [
+    {
+      "id": "pre-commit",
+      "tier": "commit",
+      "when": ".",
+      "$why": "De pre-commit-hooks die de repo zelf al heeft (opmaak, lint), op de gestagede bestanden; zonder deze check zouden ze naast poort ook nog eens apart draaien.",
+      "run": "pre-commit run --files {files}",
+      "if": "test -f .pre-commit-config.yaml",
+      "ifHint": "geen .pre-commit-config.yaml",
+      "needs": "command -v pre-commit",
+      "needsHint": "pipx install pre-commit",
+      "all": false
+    },
+    {
+      "id": "secrets",
+      "tier": "commit",
+      "when": ".",
+      "$why": "Geen sleutel, private key of .env in git: eenmaal gecommit krijg je hem niet meer uit de historie. Ingebouwd, zonder tool, in milliseconden.",
+      "run": "node {poort}/checks/secrets.mjs {files}"
+    },
+    {
+      "id": "typecheck",
+      "tier": "push",
+      "cwd": ".",
+      "when": [
+        "^.*\\.(ts|tsx|mts|cts|vue)$",
+        "^(tsconfig[^/]*\\.json|package\\.json|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock)$"
+      ],
+      "$why": "Het typecheck-script van de repo, anders tsc -b bij project references (Vite), anders tsc --noEmit. Lockfiles in when: een dependency-update kan types breken.",
+      "run": "node {poort}/checks/typecheck.mjs",
+      "if": "test -f tsconfig.json",
+      "ifHint": "geen tsconfig.json",
+      "needs": "test -x node_modules/.bin/tsc || test -x node_modules/.bin/vue-tsc",
+      "needsHint": "npm ci (of pnpm install / yarn install)",
+      "timeout": 240
+    },
+    {
+      "id": "vitest",
+      "tier": "push",
+      "cwd": ".",
+      "when": [
+        "^.*\\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|vue)$",
+        "^(package\\.json|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock|vite(st)?\\.config\\.[cm]?[jt]s)$"
+      ],
+      "fullOn": "^(package\\.json|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock|vite(st)?\\.config\\.[cm]?[jt]s)$",
+      "$why": "Alleen de tests die bij de gewijzigde bestanden horen (vitest related); na een dependency- of config-wijziging alle tests (fullOn).",
+      "run": "if printf '%s\\n' {files} | grep -qE '(^|/)(package\\.json|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock|vite(st)?\\.config\\.[cm]?[jt]s)$'; then npx --no-install vitest run --passWithNoTests; else npx --no-install vitest related --run --passWithNoTests {files}; fi",
+      "if": "grep -q '\"vitest\"' package.json",
+      "ifHint": "vitest niet in package.json",
+      "needs": "test -x node_modules/.bin/vitest",
+      "needsHint": "npm ci (of pnpm install / yarn install)",
+      "timeout": 240
+    },
+    {
+      "id": "prettier",
+      "tier": "commit",
+      "cwd": ".",
+      "when": "^.*\\.([mc]?[jt]sx?|vue|svelte|css|scss|json|md)$",
+      "$why": "Alleen als CI prettier draait (of een format:check-script).",
+      "run": "npx --no-install prettier --check {files}",
+      "if": "grep -rqsE 'prettier|format:check' \"$(git rev-parse --show-toplevel)/.github/workflows\" package.json",
+      "ifHint": "CI draait geen prettier",
+      "needs": "test -x node_modules/.bin/prettier",
+      "needsHint": "npm ci (of pnpm install / yarn install)"
+    },
+    {
+      "id": "eslint",
+      "tier": "push",
+      "cwd": ".",
+      "when": "^(?!\\.poort/).*\\.([mc]?[jt]sx?|vue|svelte)$",
+      "$why": "De eslint-config van de repo op de gewijzigde bestanden; `npm run lint` faalde in CI op precies dit.",
+      "run": "npx --no-install eslint --no-warn-ignored {files}",
+      "if": "ls eslint.config.* >/dev/null 2>&1 || ls .eslintrc* >/dev/null 2>&1",
+      "ifHint": "geen eslint-config",
+      "needs": "test -x node_modules/.bin/eslint",
+      "needsHint": "npm ci (of pnpm install / yarn install)"
+    },
+    {
+      "id": "e2e-replay",
+      "tier": "push",
+      "type": "e2e",
+      "optional": true,
+      "dir": ".",
+      "$why": "Speelt de opgenomen e2e-stappen af zonder model; e2e.config start de app zelf. Optioneel: rood, te traag of zonder tool is een waarschuwing, geen blokkade; de volledige e2e draait in CI.",
+      "when": "^(src/|app/|pages/|components/|index\\.html$|tests/[^/]*\\.e2e\\.ts$|e2e\\.config\\.m?ts$|\\.e2e/cache/)",
+      "if": "test -f e2e.config.ts || test -f e2e.config.mts",
+      "ifHint": "geen e2e.config.ts",
+      "needs": "test -d node_modules/e2e",
+      "needsHint": "npm i -D e2e @e2e-dev/web",
+      "timeout": 180
+    },
+    {
+      "id": "stale-branch",
+      "tier": "push",
+      "when": ".",
+      "cache": false,
+      "$why": "Blokkeert alleen een echt inhoudsconflict met de target-branch (git merge-tree); achterstand is advies. De branch komt uit POORT_BASE_REF, die poort zet.",
+      "run": "node {poort}/checks/stale-branch.mjs",
+      "timeout": 60
+    },
+    {
+      "id": "ripple",
+      "tier": "push",
+      "when": "^.*\\.(ts|tsx|mts|cts|js|jsx|mjs|vue)$",
+      "$why": "Advies: dezelfde functie elders nog eens gedefinieerd (een kopie die niet meeverandert).",
+      "run": "node {poort}/checks/ripple.mjs {files}",
+      "timeout": 60
+    },
+    {
+      "id": "untracked-refs",
+      "tier": "commit",
+      "when": "\\.(py|[mc]?[jt]sx?|vue|sh|ya?ml|json|toml)$",
+      "$why": "Lokaal groen, in CI rood: code die een bestand noemt dat hier wel staat maar niet in git (genegeerd of nooit toegevoegd). Blokkeert in tests, advies elders.",
+      "run": "node {poort}/checks/untracked-refs.mjs {files}"
+    },
+    {
+      "id": "actionlint",
+      "tier": "commit",
+      "when": "^\\.github/workflows/.*\\.ya?ml$",
+      "$why": "Een kapotte workflow (syntax, expressie, shell in run) ziet CI pas na de push; actionlint vindt het nu. Shellcheck-stijladvies blokkeert niet, waarschuwingen en fouten wel.",
+      "run": "actionlint {files}",
+      "env": {
+        "SHELLCHECK_OPTS": "--severity=warning"
+      },
+      "needs": "command -v actionlint",
+      "needsHint": "brew install actionlint (of go install github.com/rhysd/actionlint/cmd/actionlint@latest)"
+    },
+    {
+      "id": "toolchain",
+      "tier": "push",
+      "cache": false,
+      "when": [
+        "\\.([mc]?[jt]sx?|vue|svelte)$",
+        "(^|/)package(-lock)?\\.json$"
+      ],
+      "$why": "Zelfde Node-major als CI (setup-node in de workflows). Een andere versie geeft fouten die alleen in CI optreden.",
+      "run": "node {poort}/checks/toolchain.mjs {files}",
+      "if": "test -d .github/workflows",
+      "ifHint": "geen .github/workflows"
+    },
+    {
+      "id": "ci-parity",
+      "tier": "push",
+      "when": [
+        "^\\.github/workflows/",
+        "^poort\\.config\\.json$"
+      ],
+      "$why": "Elke CI-job op pull request of push is lokaal gedekt (\"ci\" op een check) of met reden uitgezonderd (\"ciWaive\"). Rood alleen voor wat jouw wijziging open zet: een job die je toevoegt of verandert, dekking die je uit de config haalt. Wat al open stond is advies; jobs die pas na een merge draaien tellen niet.",
+      "run": "node {poort}/checks/ci-parity.mjs",
+      "if": "test -d .github/workflows",
+      "ifHint": "geen .github/workflows"
+    },
+    {
+      "id": "deps-audit",
+      "tier": "push",
+      "when": ".",
+      "cache": false,
+      "$why": "Dezelfde dependency-scanner als CI (trivy, npm/pnpm audit, pip-audit, uv audit, uit de workflows). Blokkeert als je wijziging een lockfile raakt, anders advies; één scan per dag per lockfile-inhoud.",
+      "run": "node {poort}/checks/deps-audit.mjs",
+      "if": "test -d .github/workflows",
+      "ifHint": "geen .github/workflows"
+    }
+  ]
+}

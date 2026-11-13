@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "node .poort/integrations/pr-gate.mjs",
+        "matcher": "\\bgh\\b"
+      }
+    ]
+  }
+}
